@@ -1,12 +1,14 @@
 import random
 import time
 from typing import Optional, Union
+import re
+import jieba
+import numpy as np
 
 from ....common.database import db
 from ...chat.utils import get_embedding, get_recent_group_detailed_plain_text, get_recent_group_speaker
 from ...chat.chat_stream import chat_manager
 from ...moods.moods import MoodManager
-from ....individuality.individuality import Individuality
 from ...memory_system.Hippocampus import HippocampusManager
 from ...schedule.schedule_generator import bot_schedule
 from ...config.config import global_config
@@ -22,27 +24,12 @@ class PromptBuilder:
         self.activate_messages = ""
 
     async def _build_prompt(
-        self, chat_stream, message_txt: str, sender_name: str = "某人", stream_id: Optional[int] = None
+        self, chat_stream, message_txt: str, sender_name: str = "某人", stream_id: Optional[int] = None, 
+        search_result: Optional[str] = None
     ) -> tuple[str, str]:
     
         # 开始构建prompt
-        prompt_personality = "你"
-        #person
-        individuality = Individuality.get_instance()
-        
-        personality_core = individuality.personality.personality_core
-        prompt_personality += personality_core
-        
-        personality_sides = individuality.personality.personality_sides
-        random.shuffle(personality_sides)
-        prompt_personality += f",{personality_sides[0]}"
-        
-        identity_detail = individuality.identity.identity_detail
-        random.shuffle(identity_detail)
-        prompt_personality += f",{identity_detail[0]}"
-        
-        
-            
+
         # 关系
         who_chat_in_group = [(chat_stream.user_info.platform, 
                               chat_stream.user_info.user_id, 
@@ -119,6 +106,20 @@ class PromptBuilder:
                     )
                     keywords_reaction_prompt += rule.get("reaction", "") + "，"
 
+        # 人格选择
+        personality = global_config.PROMPT_PERSONALITY
+        probability_1 = global_config.PERSONALITY_1
+        probability_2 = global_config.PERSONALITY_2
+
+        personality_choice = random.random()
+
+        if personality_choice < probability_1:  # 第一种风格
+            prompt_personality = personality[0]
+        elif personality_choice < probability_1 + probability_2:  # 第二种风格
+            prompt_personality = personality[1]
+        else:  # 第三种人格
+            prompt_personality = personality[2]
+
         # 中文高手(新加的好玩功能)
         prompt_ger = ""
         if random.random() < 0.04:
@@ -131,9 +132,26 @@ class PromptBuilder:
         # 知识构建
         start_time = time.time()
         prompt_info = ""
-        prompt_info = await self.get_prompt_info(message_txt, threshold=0.38)
+        prompt_info = await self.get_prompt_info(message_txt, threshold=0.4)
+        
+        # 添加搜索结果到知识中
+        search_prompt = ""
+        if search_result:
+            search_prompt = f"""【搜索结果】
+我通过搜索引擎查询了用户问题，获取以下最新信息：
+
+{search_result}
+
+请将上述搜索结果作为回答的主要依据。这些是权威且最新的信息，请优先使用这些内容，并确保内容的完整性和准确性。回答时保持自然友好的对话风格，不要直接说"根据搜索结果"，而是像日常交谈那样回答。"""
+            
+            # 如果已有知识库内容，合并搜索结果
+            if prompt_info:
+                prompt_info = f"{prompt_info}\n\n{search_prompt}"
+            else:
+                prompt_info = search_prompt
+                
         if prompt_info:
-            prompt_info = f"""\n你有以下这些**知识**：\n{prompt_info}\n请你**记住上面的知识**，之后可能会用到。\n"""
+            prompt_info = f"""\n你有以下这些**知识**：\n{prompt_info}\n请你**记住上面的知识**，之后会用到。\n"""
 
         end_time = time.time()
         logger.debug(f"知识检索耗时: {(end_time - start_time):.3f}秒")
@@ -145,13 +163,12 @@ class PromptBuilder:
         logger.info("开始构建prompt")
         
         prompt = f"""
-{relation_prompt_all}
 {memory_prompt}
 {prompt_info}
 {schedule_prompt}
 {chat_target}
 {chat_talking_prompt}
-现在"{sender_name}"说的:{message_txt}。引起了你的注意，你想要在群里发言发言或者回复这条消息。\n
+现在"{sender_name}"说的:{message_txt}。引起了你的注意，你想要在群里发言发言或者回复这条消息。{relation_prompt_all}\n
 你的网名叫{global_config.BOT_NICKNAME}，有人也叫你{"/".join(global_config.BOT_ALIAS_NAMES)}，{prompt_personality}。
 你正在{chat_target_2},现在请你读读之前的聊天记录，{mood_prompt}，然后给出日常且口语化的回复，平淡一些，
 尽量简短一些。{keywords_reaction_prompt}请注意把握聊天内容，不要回复的太有条理，可以有个性。{prompt_ger}
@@ -296,12 +313,12 @@ class PromptBuilder:
             # 按主题组织输出
             for topic, results in grouped_results.items():
                 related_info += f"【主题: {topic}】\n"
-                for _i, result in enumerate(results, 1):
-                    _similarity = result["similarity"]
+                for i, result in enumerate(results, 1):
+                    similarity = result["similarity"]
                     content = result["content"].strip()
                     # 调试：为内容添加序号和相似度信息
-                    # related_info += f"{i}. [{similarity:.2f}] {content}\n"
-                    related_info += f"{content}\n"
+                    related_info += f"{i}. [{similarity:.2f}] {content}\n"
+                    # related_info += f"{content}\n"
                 related_info += "\n"
             
             logger.info(f"格式化输出完成，耗时: {time.time() - format_start_time:.3f}秒")
